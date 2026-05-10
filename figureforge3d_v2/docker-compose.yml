@@ -1,0 +1,279 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ff3d_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: figureforge3d
+      POSTGRES_USER: ff3d
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ff3d_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ff3d"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ff3d_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: ff3d_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ff3d_net
+
+  minio:
+    image: minio/minio:latest
+    container_name: ff3d_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-ff3d_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-ff3d_minio_secret}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - ff3d_net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend/Dockerfile
+    container_name: ff3d_backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ff3d:${POSTGRES_PASSWORD:-ff3d_secret}@postgres:5432/figureforge3d
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-ff3d_admin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-ff3d_minio_secret}
+      BG_REMOVAL_URL: http://ff3d_bg_removal:8010
+      PATTERN_BG_URL: http://ff3d_pattern_bg:8011
+      COLMAP_URL: http://ff3d_colmap:8012
+      SUGAR_URL: http://ff3d_sugar:8013
+      GOF_URL: http://ff3d_gof:8014
+    volumes:
+      - ./backend:/app
+      - shared_data:/shared
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ff3d_net
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend/Dockerfile
+    container_name: ff3d_celery
+    restart: unless-stopped
+    command: celery -A app.tasks.pipeline worker --loglevel=info --concurrency=2 -Q pipeline
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ff3d:${POSTGRES_PASSWORD:-ff3d_secret}@postgres:5432/figureforge3d
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-ff3d_admin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-ff3d_minio_secret}
+      BG_REMOVAL_URL: http://ff3d_bg_removal:8010
+      PATTERN_BG_URL: http://ff3d_pattern_bg:8011
+      COLMAP_URL: http://ff3d_colmap:8012
+      SUGAR_URL: http://ff3d_sugar:8013
+      GOF_URL: http://ff3d_gof:8014
+    volumes:
+      - ./backend:/app
+      - shared_data:/shared
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - ff3d_net
+
+  # ── AI Workers ─────────────────────────────────────────────────────────────
+  bg_removal:
+    build:
+      context: ./ai_workers
+      dockerfile: ../docker/bg_removal/Dockerfile
+    container_name: ff3d_bg_removal
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./ai_workers:/app
+      - shared_data:/shared
+      - model_weights:/weights
+    ports:
+      - "8010:8010"
+    networks:
+      - ff3d_net
+
+  pattern_bg:
+    build:
+      context: ./ai_workers
+      dockerfile: ../docker/pattern_bg/Dockerfile
+    container_name: ff3d_pattern_bg
+    restart: unless-stopped
+    volumes:
+      - ./ai_workers:/app
+      - shared_data:/shared
+    ports:
+      - "8011:8011"
+    networks:
+      - ff3d_net
+
+  video_processor:
+    build:
+      context: ./ai_workers
+      dockerfile: ../docker/video_processor/Dockerfile
+    container_name: ff3d_video
+    restart: unless-stopped
+    environment:
+      WORKER_PORT: "8015"
+    volumes:
+      - ./ai_workers:/app
+      - shared_data:/shared
+    ports:
+      - "8015:8015"
+    networks:
+      - ff3d_net
+
+  colmap_worker:
+    build:
+      context: ./ai_workers
+      dockerfile: ../docker/colmap_worker/Dockerfile
+    container_name: ff3d_colmap
+    restart: unless-stopped
+    volumes:
+      - ./ai_workers:/app
+      - shared_data:/shared
+    ports:
+      - "8012:8012"
+    networks:
+      - ff3d_net
+
+  sugar_worker:
+    build:
+      context: ./ai_workers
+      dockerfile: ../docker/ai_core_sugar/Dockerfile
+    container_name: ff3d_sugar
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      TORCH_CUDA_ARCH_LIST: "8.9"
+    volumes:
+      - ./ai_workers:/app
+      - shared_data:/shared
+      - model_weights:/weights
+    ports:
+      - "8013:8013"
+    networks:
+      - ff3d_net
+
+  gof_worker:
+    build:
+      context: ./ai_workers
+      dockerfile: ../docker/ai_core_gof/Dockerfile
+    container_name: ff3d_gof
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      TORCH_CUDA_ARCH_LIST: "8.9"
+    volumes:
+      - ./ai_workers:/app
+      - shared_data:/shared
+      - model_weights:/weights
+    ports:
+      - "8014:8014"
+    networks:
+      - ff3d_net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/frontend/Dockerfile
+      target: development
+    container_name: ff3d_frontend
+    restart: unless-stopped
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    networks:
+      - ff3d_net
+
+  nginx:
+    image: nginx:alpine
+    container_name: ff3d_nginx
+    restart: unless-stopped
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - ff3d_net
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  shared_data:
+  model_weights:
+
+networks:
+  ff3d_net:
+    driver: bridge
