@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/shared/outputs/52fe1b96090f43e5aef05ec15b958368/workspace/colmap', model_path='/shared/outputs/52fe1b96090f43e5aef05ec15b958368/reconstruction/gs_pretrain', images='images', resolution=-1, white_background=True, data_device='cuda', eval=False)
